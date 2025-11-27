@@ -1,143 +1,214 @@
-const express = require('express');
-const app = express();
-const port = 3200;
+const express = require("express");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const db = require("./database");
+const { authenticateToken, authorizeRole } = require("./middleware/auth.js");
 
+const app = express();
 app.use(express.json());
 
+const JWT_SECRET = process.env.JWT_SECRET || "secret123";
 
-let movies = [
-    { id: 1, title: 'Inception', director: 'Christopher Nolan', releaseYear: 2010 },
-    { id: 2, title: 'The Matrix', director: 'Lana Wachowski', releaseYear: 1999 },
-    { id: 3, title: 'Parasite', director: 'Bong Joon-ho', releaseYear: 2019 }
-];
-let movieIdCounter = movies.length + 1;
 
-let directors = [
-    { id: 1, name: 'Christopher Nolan', birthYear: 1970 },
-    { id: 2, name: 'Steven Spielberg', birthYear: 1946 },
-    { id: 3, name: 'Quentin Tarantino', birthYear: 1963 }
-];
-let directorIdCounter = directors.length + 1;
+// AUTH
+// REGISTER USER
+app.post("/auth/register", (req, res) => {
+    const { username, password } = req.body;
 
-// --- API UNTUK MOVIES ---
+    if (!username || !password)
+        return res.status(400).json({ error: "username & password wajib" });
 
-// GET: Mendapatkan semua film
-app.get('/movies', (req, res) => {
-    res.json(movies);
+    bcrypt.hash(password, 10, (err, hashedPassword) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const sql = "INSERT INTO users (username, password, role) VALUES (?, ?, ?)";
+        db.run(sql, [username.toLowerCase(), hashedPassword, "user"], function (err) {
+            if (err) {
+                if (err.message.includes("UNIQUE")) {
+                    return res.status(409).json({ error: "Username sudah digunakan" });
+                }
+                return res.status(500).json({ error: err.message });
+            }
+
+            res.status(201).json({ message: "Registrasi berhasil", userId: this.lastID });
+        });
+    });
 });
 
-// GET: Mendapatkan film berdasarkan ID
-app.get('/movies/:id', (req, res) => {
-    const movie = movies.find(m => m.id === parseInt(req.params.id));
-    if (!movie) {
-        return res.status(404).json({ message: 'Film tidak ditemukan.' });
-    }
-    res.json(movie);
+// REGISTER ADMIN 
+app.post("/auth/register-admin", (req, res) => {
+    const { username, password } = req.body;
+
+    bcrypt.hash(password, 10, (err, hashedPassword) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const sql = "INSERT INTO users (username, password, role) VALUES (?, ?, ?)";
+        db.run(sql, [username.toLowerCase(), hashedPassword, "admin"], function (err) {
+            if (err) {
+                if (err.message.includes("UNIQUE")) {
+                    return res.status(409).json({ error: "Admin sudah ada" });
+                }
+                return res.status(500).json({ error: err.message });
+            }
+
+            res.status(201).json({
+                message: "Admin berhasil dibuat",
+                userId: this.lastID,
+            });
+        });
+    });
 });
 
-// POST: Membuat film baru
-app.post('/movies', (req, res) => {
-    const { title, director, releaseYear } = req.body;
-    if (!title || !director || !releaseYear) {
-        return res.status(400).json({ message: 'Judul, sutradara, dan tahun rilis harus diisi.' });
-    }
-    const newMovie = {
-        id: movieIdCounter++,
-        title,
-        director,
-        releaseYear
-    };
-    movies.push(newMovie);
-    res.status(201).json(newMovie);
+// LOGIN
+app.post("/auth/login", (req, res) => {
+    const { username, password } = req.body;
+
+    db.get("SELECT * FROM users WHERE username = ?", [username.toLowerCase()], (err, user) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!user) return res.status(404).json({ error: "User tidak ditemukan" });
+
+        bcrypt.compare(password, user.password, (err, match) => {
+            if (!match) return res.status(401).json({ error: "Password salah" });
+
+            const payload = {
+                user: {
+                    id: user.id,
+                    username: user.username,
+                    role: user.role,
+                },
+            };
+
+            jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" }, (err, token) => {
+                if (err) return res.status(500).json({ error: err.message });
+
+                res.json({ message: "Login berhasil", token });
+            });
+        });
+    });
 });
 
-// PUT: Memperbarui film
-app.put('/movies/:id', (req, res) => {
-    const movie = movies.find(m => m.id === parseInt(req.params.id));
-    if (!movie) {
-        return res.status(404).json({ message: 'Film tidak ditemukan.' });
-    }
-    const { title, director, releaseYear } = req.body;
-    if (title) {
-        movie.title = title;
-    }
-    if (director) {
-        movie.director = director;
-    }
-    if (releaseYear) {
-        movie.releaseYear = releaseYear;
-    }
-    res.json(movie);
+
+// MOVIES
+// GET (PUBLIC)
+app.get("/movies", (req, res) => {
+    db.all("SELECT * FROM movies", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
 });
 
-// DELETE: Menghapus film
-app.delete('/movies/:id', (req, res) => {
-    const initialLength = movies.length;
-    movies = movies.filter(m => m.id !== parseInt(req.params.id));
-    if (movies.length === initialLength) {
-        return res.status(404).json({ message: 'Film tidak ditemukan.' });
-    }
-    res.json({ message: 'Film berhasil dihapus.' });
+// POST (LOGIN)
+app.post("/movies", authenticateToken, (req, res) => {
+    const { title, year } = req.body;
+
+    db.run("INSERT INTO movies (title, year) VALUES (?, ?)", [title, year], function (err) {
+        if (err) return res.status(500).json({ error: err.message });
+
+        res.status(201).json({ message: "Movie ditambahkan", id: this.lastID });
+    });
 });
 
-// --- API UNTUK DIRECTORS (SUTRADARA) ---
+// PUT (ADMIN)
+app.put(
+    "/movies/:id",
+    [authenticateToken, authorizeRole("admin")],
+    (req, res) => {
+        const { title, year } = req.body;
 
-// GET: Mendapatkan semua sutradara
-app.get('/directors', (req, res) => {
-    res.json(directors);
+        db.run(
+            "UPDATE movies SET title=?, year=? WHERE id=?",
+            [title, year, req.params.id],
+            function (err) {
+                if (err) return res.status(500).json({ error: err.message });
+
+                res.json({ message: "Movie diperbarui" });
+            }
+        );
+    }
+);
+
+// DELETE (ADMIN)
+app.delete(
+    "/movies/:id",
+    [authenticateToken, authorizeRole("admin")],
+    (req, res) => {
+        db.run("DELETE FROM movies WHERE id=?", [req.params.id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            res.status(204).send();
+        });
+    }
+);
+
+
+// DIRECTORS 
+// GET ALL (PUBLIC)
+app.get("/directors", (req, res) => {
+    db.all("SELECT * FROM directors", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
 });
 
-// GET: Mendapatkan sutradara berdasarkan ID
-app.get('/directors/:id', (req, res) => {
-    const director = directors.find(d => d.id === parseInt(req.params.id));
-    if (!director) {
-        return res.status(404).json({ message: 'Sutradara tidak ditemukan.' });
-    }
-    res.json(director);
+// GET ONE (PUBLIC)
+app.get("/directors/:id", (req, res) => {
+    db.get("SELECT * FROM directors WHERE id=?", [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(row);
+    });
 });
 
-// POST: Membuat sutradara baru
-app.post('/directors', (req, res) => {
-    const { name, birthYear } = req.body;
-    if (!name || !birthYear) {
-        return res.status(400).json({ message: 'Nama dan tahun lahir harus diisi.' });
-    }
-    const newDirector = {
-        id: directorIdCounter++,
-        name,
-        birthYear
-    };
-    directors.push(newDirector);
-    res.status(201).json(newDirector);
+// POST (LOGIN SAJA)
+app.post("/directors", authenticateToken, (req, res) => {
+    const { name, country } = req.body;
+
+    db.run(
+        "INSERT INTO directors (name, country) VALUES (?, ?)",
+        [name, country],
+        function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            res.status(201).json({
+                message: "Director ditambahkan",
+                id: this.lastID,
+            });
+        }
+    );
 });
 
-// PUT: Memperbarui sutradara
-app.put('/directors/:id', (req, res) => {
-    const director = directors.find(d => d.id === parseInt(req.params.id));
-    if (!director) {
-        return res.status(404).json({ message: 'Sutradara tidak ditemukan.' });
-    }
-    const { name, birthYear } = req.body;
-    if (name) {
-        director.name = name;
-    }
-    if (birthYear) {
-        director.birthYear = birthYear;
-    }
-    res.json(director);
-});
+// PUT (ADMIN)
+app.put(
+    "/directors/:id",
+    [authenticateToken, authorizeRole("admin")],
+    (req, res) => {
+        const { name, country } = req.body;
 
-// DELETE: Menghapus sutradara
-app.delete('/directors/:id', (req, res) => {
-    const initialLength = directors.length;
-    directors = directors.filter(d => d.id !== parseInt(req.params.id));
-    if (directors.length === initialLength) {
-        return res.status(404).json({ message: 'Sutradara tidak ditemukan.' });
-    }
-    res.json({ message: 'Sutradara berhasil dihapus.' });
-});
+        db.run(
+            "UPDATE directors SET name=?, country=? WHERE id=?",
+            [name, country, req.params.id],
+            function (err) {
+                if (err) return res.status(500).json({ error: err.message });
 
-// Menjalankan server
-app.listen(port, () => {
-    console.log(`Server berjalan di http://localhost:${port}`);
-});
+                res.json({ message: "Director diperbarui" });
+            }
+        );
+    }
+);
+
+// DELETE (ADMIN)
+app.delete(
+    "/directors/:id",
+    [authenticateToken, authorizeRole("admin")],
+    (req, res) => {
+        db.run("DELETE FROM directors WHERE id=?", [req.params.id], function (err) {
+            if (err) return res.status(500).json({ error: err.message });
+
+            res.status(204).send();
+        });
+    }
+);
+
+
+// SERVER
+
+app.listen(3000, () => console.log("Server berjalan di port 3000"));
